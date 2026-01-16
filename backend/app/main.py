@@ -166,15 +166,28 @@ def get_item(item_id: str, db: Session = Depends(get_db)):
         return {"error": "not_found"}
     return dict(row)
 
+@app.get("/items/recent")
+def list_recent_items(limit: int = 20, db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+      SELECT id, source_type, title, source_uri, status, ingested_at, error_message
+      FROM knowledge_items
+      WHERE user_id=:user_id
+      ORDER BY ingested_at DESC
+      LIMIT :limit
+    """), {"user_id": DEMO_USER_ID, "limit": limit}).mappings().all()
+    return {"items": [dict(r) for r in rows]}
+
 @app.post("/chat")
 def chat(req: ChatReq, db: Session = Depends(get_db)):
     item_id = req.item_id
     if not item_id:
         row = db.execute(text("""
-          SELECT id
-          FROM knowledge_items
-          WHERE user_id=:user_id AND status='READY'
-          ORDER BY ingested_at DESC
+          SELECT ki.id
+          FROM knowledge_items ki
+          JOIN chunks c ON c.item_id = ki.id
+          WHERE ki.user_id=:user_id AND ki.status='READY'
+          GROUP BY ki.id, ki.ingested_at
+          ORDER BY ki.ingested_at DESC
           LIMIT 1
         """), {"user_id": DEMO_USER_ID}).mappings().first()
         if row:
@@ -191,4 +204,4 @@ def chat(req: ChatReq, db: Session = Depends(get_db)):
     )
     answer, model = answer_question(req.query, evidence)
     citations = [{"citation": e["citation"], "chunk_id": e["chunk_id"], "item_id": e["item_id"]} for e in evidence]
-    return {"answer": answer, "citations": citations, "model": model}
+    return {"answer": answer, "citations": citations, "model": model, "item_id": item_id}

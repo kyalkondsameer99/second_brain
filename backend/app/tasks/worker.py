@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import sys
+import subprocess
 import json
 import hashlib
 import concurrent.futures
@@ -45,6 +47,69 @@ def _simple_chunks(text: str, max_chars: int = 2000) -> list[str]:
     if not text:
         return []
     return [text[i:i + max_chars].strip() for i in range(0, len(text), max_chars) if text[i:i + max_chars].strip()]
+
+def _extract_pdf_via_subprocess(file_path: str, max_pages: int, max_chars_total: int):
+    script = r"""
+import json
+import sys
+from datetime import datetime, timezone
+from pypdf import PdfReader
+
+path = sys.argv[1]
+max_pages = int(sys.argv[2])
+max_chars_total = int(sys.argv[3])
+
+reader = PdfReader(path, strict=False)
+pages = []
+total_chars = 0
+total_pages = len(reader.pages)
+
+for idx in range(min(total_pages, max_pages)):
+    try:
+        txt = (reader.pages[idx].extract_text() or "").strip()
+    except Exception:
+        txt = ""
+    pages.append(txt)
+    total_chars += len(txt)
+    if total_chars >= max_chars_total:
+        break
+
+full_text = "\n\n".join([p for p in pages if p])
+meta = {
+    "file_type": "pdf",
+    "page_count": total_pages,
+    "extracted_at": datetime.now(timezone.utc).isoformat(),
+}
+if total_pages > max_pages:
+    meta["truncated_pages"] = True
+    meta["page_limit"] = max_pages
+if total_chars >= max_chars_total:
+    meta["truncated_chars"] = True
+    meta["char_limit"] = max_chars_total
+
+print(json.dumps({
+    "title": "PDF Document",
+    "full_text": full_text,
+    "pages": pages,
+    "meta": meta,
+}))
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, file_path, str(max_pages), str(max_chars_total)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ValueError("pdf_extract_timeout") from e
+    if result.returncode != 0:
+        raise ValueError(f"pdf_extract_failed: {result.stderr.strip()}")
+    try:
+        payload = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError as e:
+        raise ValueError("pdf_extract_bad_output") from e
+    return payload["title"], payload["full_text"], payload["meta"], payload["pages"]
 
 def _set_status(db, item_id: str, status: str, err: str | None = None):
     db.rollback()
@@ -186,6 +251,12 @@ def ingest_web(item_id: str, user_id: str, url: str):
 
         _merge_metadata(db, item_id, {"domain": domain, **meta})
 
+        if not text_content.strip():
+            fallback = f"Web URL: {url}"
+            _insert_chunks_no_embed(db, user_id, item_id, [fallback], "URL", url, "")
+            _set_status(db, item_id, "READY", None)
+            return
+
         try:
             chunks = _run_with_timeout(_simple_chunks, 10, text_content)
         except SoftTimeLimitExceeded:
@@ -295,7 +366,25 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
             raise ValueError("document_file_missing")
 
         if doc_type == "pdf":
-            title, full_text, meta, pages = extract_pdf_text_from_path(file_path)
+            fallback_only = False
+            try:
+                title, full_text, meta, pages = _extract_pdf_via_subprocess(
+                    file_path,
+                    max_pages=3,
+                    max_chars_total=10000,
+                )
+                if not full_text.strip():
+                    raise ValueError("pdf_empty_text")
+            except Exception as e:
+                title = os.path.basename(file_path)
+                full_text = ""
+                pages = []
+                meta = {
+                    "file_type": "pdf",
+                    "extracted_at": _now_utc().isoformat(),
+                    "extract_error": str(e),
+                }
+                fallback_only = True
 
             db.execute(text("""
               UPDATE knowledge_items
@@ -304,6 +393,20 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
             """), {"title": title, "uri": os.path.basename(file_path), "id": item_id})
             db.commit()
             _merge_metadata(db, item_id, meta)
+
+            if fallback_only:
+                fallback_text = f"PDF uploaded: {os.path.basename(file_path)}"
+                _insert_chunks_no_embed(
+                    db,
+                    user_id,
+                    item_id,
+                    [fallback_text],
+                    "PDF_PAGE",
+                    "0",
+                    "0",
+                )
+                _set_status(db, item_id, "READY", None)
+                return
 
             # Chunk per page first (keeps citation simple and trustworthy)
             # Each page may produce multiple chunks via chunk_text.
@@ -345,9 +448,12 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
                     break
 
         elif doc_type == "md":
-            with open(file_path, "rb") as f:
-                data = f.read()
-            title, md_text, meta = extract_md_text(data)
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                title, md_text, meta = _run_with_timeout(extract_md_text, 10, data)
+            except Exception:
+                raise ValueError("md_extract_timeout")
 
             db.execute(text("""
               UPDATE knowledge_items

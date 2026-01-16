@@ -94,6 +94,21 @@ with tab2:
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
 
+    # Select an item to chat against (prefer docs)
+    selected_item_id = None
+    try:
+        recent = requests.get(f"{BACKEND_URL}/items/recent", timeout=10).json().get("items", [])
+    except Exception:
+        recent = []
+    if recent:
+        options = [("Auto (latest READY with chunks)", None)]
+        for it in recent:
+            label = f"{it.get('source_type')} | {it.get('title') or it.get('source_uri') or it.get('id')} | {it.get('status')}"
+            options.append((label, it.get("id")))
+        labels = [o[0] for o in options]
+        choice = st.selectbox("Chat target", labels, index=0)
+        selected_item_id = dict(options).get(choice)
+
     # Render chat history
     for m in st.session_state["messages"]:
         with st.chat_message(m["role"]):
@@ -114,7 +129,10 @@ with tab2:
             placeholder = st.empty()
             placeholder.markdown("Thinking...")
 
-            resp = requests.post(f"{BACKEND_URL}/chat", json={"query": q}, timeout=180)
+            payload = {"query": q}
+            if selected_item_id:
+                payload["item_id"] = selected_item_id
+            resp = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=180)
             data = resp.json()
 
             answer = data.get("answer", "")
