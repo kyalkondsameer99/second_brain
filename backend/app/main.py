@@ -16,6 +16,7 @@ from app.tasks.worker import ingest_audio, ingest_web, ingest_document, ingest_i
 UPLOAD_DIR = "/app/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAX_DOC_BYTES = 25 * 1024 * 1024
 
 # For a prototype: fixed demo user
 DEMO_USER_ID = "00000000-0000-0000-0000-000000000001"
@@ -96,8 +97,18 @@ async def ingest_document_endpoint(file: UploadFile = File(...), db: Session = D
     fname = f"{item_id}_{file.filename}"
     fpath = os.path.join(UPLOAD_DIR, fname)
 
+    total = 0
     with open(fpath, "wb") as out:
-        out.write(await file.read())
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_DOC_BYTES:
+                out.close()
+                os.remove(fpath)
+                return {"error": "document_too_large", "max_mb": MAX_DOC_BYTES // (1024 * 1024)}
+            out.write(chunk)
 
     # Insert item as PENDING
     stype = "PDF" if ext == "pdf" else "MARKDOWN"

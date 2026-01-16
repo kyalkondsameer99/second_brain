@@ -12,7 +12,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.ingest.chunking import chunk_text
 from app.ingest.web_extract import extract_web_text
-from app.ingest.doc_extract import extract_pdf_text, extract_md_text
+from app.ingest.doc_extract import extract_pdf_text, extract_pdf_text_from_path, extract_md_text
 from app.services.embeddings import embed_texts, to_pgvector_literal
 from celery.exceptions import SoftTimeLimitExceeded
 from app.tasks.celery_app import celery_app
@@ -287,11 +287,15 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
     try:
         _set_status(db, item_id, "PROCESSING", None)
 
-        with open(file_path, "rb") as f:
-            data = f.read()
+        max_bytes = 25 * 1024 * 1024
+        try:
+            if os.path.getsize(file_path) > max_bytes:
+                raise ValueError("document_file_too_large_max_25mb")
+        except OSError:
+            raise ValueError("document_file_missing")
 
         if doc_type == "pdf":
-            title, full_text, meta, pages = extract_pdf_text(data)
+            title, full_text, meta, pages = extract_pdf_text_from_path(file_path)
 
             db.execute(text("""
               UPDATE knowledge_items
@@ -304,24 +308,22 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
             # Chunk per page first (keeps citation simple and trustworthy)
             # Each page may produce multiple chunks via chunk_text.
             chunk_idx = 0
+            max_total_chunks = 80
             for i, page_text in enumerate(pages, start=1):
                 if not page_text.strip():
                     continue
                 page_chunks = chunk_text(page_text)
                 if not page_chunks:
                     continue
-
-                # Insert page chunks; pointer is page i
-                embeddings = _embed_or_none(page_chunks)
-                for txt, emb in zip(page_chunks, embeddings):
+                # Insert page chunks; pointer is page i. Skip embeddings for stability.
+                for txt in page_chunks:
                     chash = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-                    emb_lit = to_pgvector_literal(emb) if emb is not None else None
                     db.execute(text("""
                       INSERT INTO chunks (
                         id, user_id, item_id, chunk_index, text, embedding, chunk_hash,
                         pointer_type, pointer_start, pointer_end, created_at
                       ) VALUES (
-                        gen_random_uuid(), :user_id, :item_id, :chunk_index, :text, CAST(:embedding AS vector), :chunk_hash,
+                        gen_random_uuid(), :user_id, :item_id, :chunk_index, :text, NULL, :chunk_hash,
                         'PDF_PAGE', :ps, :pe, :created_at
                       )
                       ON CONFLICT (item_id, chunk_index) DO NOTHING
@@ -330,16 +332,21 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
                         "item_id": item_id,
                         "chunk_index": chunk_idx,
                         "text": txt,
-                        "embedding": emb_lit,
                         "chunk_hash": chash,
                         "ps": str(i),
                         "pe": str(i),
                         "created_at": _now_utc(),
                     })
                     chunk_idx += 1
+                    if chunk_idx >= max_total_chunks:
+                        break
                 db.commit()
+                if chunk_idx >= max_total_chunks:
+                    break
 
         elif doc_type == "md":
+            with open(file_path, "rb") as f:
+                data = f.read()
             title, md_text, meta = extract_md_text(data)
 
             db.execute(text("""
@@ -351,7 +358,9 @@ def ingest_document(item_id: str, user_id: str, file_path: str, doc_type: str):
             _merge_metadata(db, item_id, meta)
 
             md_chunks = chunk_text(md_text)
-            _insert_chunks(db, user_id, item_id, md_chunks, "NOTE_RANGE", "0", "0")
+            if len(md_chunks) > 80:
+                md_chunks = md_chunks[:80]
+            _insert_chunks_no_embed(db, user_id, item_id, md_chunks, "NOTE_RANGE", "0", "0")
 
         else:
             raise ValueError("Unsupported doc_type; must be 'pdf' or 'md'")

@@ -26,6 +26,16 @@ def extract_pdf_text(pdf_bytes: bytes):
     pages[] is a list of page texts (1-index mapping handled by caller).
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
+    return _extract_from_reader(reader)
+
+def extract_pdf_text_from_path(path: str):
+    """
+    Extract PDF text from a file path without loading all bytes into memory.
+    """
+    reader = PdfReader(path)
+    return _extract_from_reader(reader)
+
+def _extract_from_reader(reader: PdfReader):
     pages = [(p.extract_text() or "").strip() for p in reader.pages]
     full_text = "\n\n".join([p for p in pages if p])
 
